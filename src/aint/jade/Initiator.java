@@ -13,6 +13,7 @@ import jade.lang.acl.ACLMessage;
 import jade.lang.acl.MessageTemplate;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -94,7 +95,9 @@ public class Initiator extends Agent {
         private Status status = Status.IDLE;
         private MessageTemplate mt;
         private int replysCount;
-        private AID firstFree;
+        private ACLMessage firstFree;
+        private List<ACLMessage> refusingAID;
+        private Date deadline;
 
         @Override
         public void action() {
@@ -115,7 +118,8 @@ public class Initiator extends Agent {
                             ACLMessage reply = myAgent.receive(m);
                             if (reply != null) {
 
-                                if (reply.getPerformative() == ACLMessage.CONFIRM) {
+                                if (reply.getPerformative() == ACLMessage.INFORM
+                                        && reply.getContent().equals("done")) {
 
                                     System.out.println("Initiator - agent " + getAID().getName()
                                             + " terminated task successfully " + pendingTasks.get(m).getTask().getTaskType() + ".");
@@ -156,6 +160,9 @@ public class Initiator extends Agent {
                             }
                             cfp.setContent(task.getTaskType());
                             cfp.setReplyWith("cfp" + System.currentTimeMillis());
+
+                            deadline = new Date(System.currentTimeMillis() + (1000 * 5));
+                            cfp.setReplyByDate(deadline);
                             myAgent.send(cfp);
 
                             // Preparo il template per la risposta
@@ -169,14 +176,15 @@ public class Initiator extends Agent {
 
                             replysCount = 0;
                             firstFree = null;
+                            refusingAID = new ArrayList<>();
                             status = Status.WAITNG_RESPONSE;
 
                         } else {
                             block(3000);
                         }
 
-                    // Se non ho più task da smistare e non ho task appesi
-                    // rimuovo il behaviour, altrimenti attendo messaggi
+                        // Se non ho più task da smistare e non ho task appesi
+                        // rimuovo il behaviour, altrimenti attendo messaggi
                     } else if (pendingTasks.isEmpty()) {
                         myAgent.removeBehaviour(this);
 
@@ -190,34 +198,48 @@ public class Initiator extends Agent {
                     break;
 
                 case WAITNG_RESPONSE:
-                    ACLMessage reply = myAgent.receive(mt);
-                    if (reply != null) {
+                    Date now = new Date();
+                    if (deadline.after(now)) {
+                        ACLMessage reply = myAgent.receive(mt);
+                        if (reply != null) {
 
-                        if (reply.getPerformative() == ACLMessage.PROPOSE
-                                && firstFree == null) {
-                            firstFree = reply.getSender();
+                            if (reply.getPerformative() == ACLMessage.PROPOSE) {
+                                if (firstFree == null) {
+                                    firstFree = reply;
+                                } else {
+                                    refusingAID.add(reply);
+                                }
+                            }
+
+                            replysCount++;
+
+                            System.out.println("Initiator - agent " + getAID().getName()
+                                    + " received response: " + replysCount
+                                    + "/" + participants.length + ".");
+
+                        } else {
+                            block(deadline.getTime() - now.getTime()); // Attendo messaggi
                         }
-
-                        replysCount++;
-
-                        System.out.println("Initiator - agent " + getAID().getName()
-                                + " received response: " + replysCount
-                                + "/" + participants.length + ".");
-
-                        if (replysCount >= participants.length) {
-                            status = firstFree == null ? Status.IDLE : Status.START;
-                        }
-
-                    } else {
-                        block(); // Attendo messaggi
                     }
+
+                    if (replysCount >= participants.length || deadline.before(now)) {
+                        status = firstFree == null ? Status.IDLE : Status.START;
+                    }
+
                     break;
 
                 case START:
                     try {
+                        ACLMessage refusing = new ACLMessage(ACLMessage.REJECT_PROPOSAL);
+                        refusingAID.stream().forEach((reply) -> {
+                            refusing.addReceiver(reply.getSender());
+                            refusing.setConversationId(reply.getConversationId());
+                        });
+                        myAgent.send(refusing);
+
                         Task t = tasks.poll();
                         ACLMessage sendTask = new ACLMessage(ACLMessage.ACCEPT_PROPOSAL);
-                        sendTask.addReceiver(firstFree);
+                        sendTask.addReceiver(firstFree.getSender());
                         sendTask.setConversationId("task-execute");
                         sendTask.setReplyWith("send" + System.currentTimeMillis());
                         sendTask.setContentObject(t);

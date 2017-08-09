@@ -15,6 +15,7 @@ import jade.domain.FIPAException;
 import jade.lang.acl.ACLMessage;
 import jade.lang.acl.MessageTemplate;
 import jade.lang.acl.UnreadableException;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.logging.Level;
@@ -30,6 +31,8 @@ public class Participant extends Agent {
     private boolean working;
     private ACLMessage executionReply;
     private Task executionTask;
+    private Status status;
+    private MessageTemplate mt;
 
     @Override
     protected void setup() {
@@ -37,6 +40,7 @@ public class Participant extends Agent {
         runnableTasks = new HashSet<>();
         runnableTasks.add("image");
         working = false;
+        status = Status.IDLE;
 
         DFAgentDescription dfd = new DFAgentDescription();
         dfd.setName(getAID());
@@ -72,92 +76,112 @@ public class Participant extends Agent {
         @Override
         public void action() {
 
-            // Verifica le richieste da parte dell'initiator e ripsondi in base
-            // al roprio stato.
-            MessageTemplate mt = MessageTemplate.MatchPerformative(ACLMessage.CFP);
-            ACLMessage message = myAgent.receive(mt);
-            if (message != null) {
-                
-                ACLMessage reply = message.createReply();
+            switch (status) {
 
-                // Se non vi sono lavori in corso e il task richiesto è
-                // compreso nei task che il participant può eseguire
-                // allora proponiti per tale task, altrimenti rifiuta.
-                if (!working && runnableTasks.contains(message.getContent())) {
-                    reply.setPerformative(ACLMessage.PROPOSE);
-                    reply.setContent("ready");
-                    
-                    System.out.println("Participant - agent " + getAID().getName()
-                            + " received new request: PROPOSING.");
-                    
-                } else {
-                    reply.setPerformative(ACLMessage.REFUSE);
-                    reply.setContent("busy");
-                    
-                    System.out.println("Participant - agent " + getAID().getName()
-                            + " received new request: REFUSING.");
-                    
-                }
+                case IDLE:
+                    // Verifica le richieste da parte dell'initiator e ripsondi in base
+                    // al roprio stato.
+                    mt = MessageTemplate.MatchPerformative(ACLMessage.CFP);
+                    ACLMessage message = myAgent.receive(mt);
+                    if (message != null && message.getReplyByDate().after(new Date())) {
 
-                myAgent.send(reply);
+                        ACLMessage reply = message.createReply();
 
-            }
+                        // Se non vi sono lavori in corso e il task richiesto è
+                        // compreso nei task che il participant può eseguire
+                        // allora proponiti per tale task, altrimenti rifiuta.
+                        if (!working && runnableTasks.contains(message.getContent())) {
+                            reply.setPerformative(ACLMessage.PROPOSE);
+                            reply.setContent("ready");
 
-            if (working) {
+                            System.out.println("Participant - agent " + getAID().getName()
+                                    + " received new request: PROPOSING.");
 
-                executionTask.executeStep();
-                System.out.println("Participant - agent " + getAID().getName()
-                        + ": " + (executionTask.getProgress() * 100) + "%.");
+                            status = Status.PROPOSING;
+                            mt = MessageTemplate.or(
+                                    MessageTemplate.MatchPerformative(ACLMessage.ACCEPT_PROPOSAL),
+                                    MessageTemplate.MatchPerformative(ACLMessage.REJECT_PROPOSAL)
+                            );
 
-                if (executionTask.isFailed()) {
+                        } else {
+                            reply.setPerformative(ACLMessage.REFUSE);
+                            reply.setContent("busy");
 
-                    executionReply.setPerformative(ACLMessage.FAILURE);
-                    executionReply.setContent("failed");
-                    myAgent.send(executionReply);
-                    working = false;
-                    
-                    System.out.println("Participant - agent " + getAID().getName()
-                            + " execution FAILED.");
+                            System.out.println("Participant - agent " + getAID().getName()
+                                    + " received new request: REFUSING.");
 
-                } else if (executionTask.isEnded()) {
+                        }
 
-                    executionReply.setPerformative(ACLMessage.CONFIRM);
-                    executionReply.setContent("ended");
-                    myAgent.send(executionReply);
-                    working = false;
-                    
-                    System.out.println("Participant - agent " + getAID().getName()
-                            + " execution ENDED.");
+                        myAgent.send(reply);
 
-                }
+                    }
+                    break;
 
-            } else {
+                case PROPOSING:
 
-                mt = MessageTemplate.MatchPerformative(ACLMessage.ACCEPT_PROPOSAL);
-                message = myAgent.receive(mt);
-                if (message != null) {
+                    message = myAgent.receive(mt);
+                    if (message != null) {
+                        if (message.getPerformative() == ACLMessage.ACCEPT_PROPOSAL) {
+                            try {
 
-                    try {
+                                executionTask = (Task) message.getContentObject();
+                                executionReply = message.createReply();
 
-                        executionTask = (Task) message.getContentObject();
-                        executionReply = message.createReply();
+                                status = Status.WORKING;
 
-                        working = true;
-                        
-                        System.out.println("Participant - agent " + getAID().getName()
-                            + " received task: STARTING.");
+                                System.out.println("Participant - agent " + getAID().getName()
+                                        + " received task: STARTING.");
 
-                    } catch (UnreadableException ex) {
-                        ex.printStackTrace();
+                            } catch (UnreadableException ex) {
+                                ex.printStackTrace();
+                            }
+                        } else {
+                            status = Status.IDLE;
+                        }
+                    } else {
+                        block();
                     }
 
-                } else {
-                    block();
-                }
+                    break;
 
+                case WORKING:
+
+                    executionTask.executeStep();
+                    System.out.println("Participant - agent " + getAID().getName()
+                            + ": " + (executionTask.getProgress() * 100) + "%.");
+
+                    if (executionTask.isFailed()) {
+
+                        executionReply.setPerformative(ACLMessage.FAILURE);
+                        executionReply.setContent("failed");
+                        myAgent.send(executionReply);
+                        status = Status.IDLE;
+
+                        System.out.println("Participant - agent " + getAID().getName()
+                                + " execution FAILED.");
+
+                    } else if (executionTask.isEnded()) {
+
+                        executionReply.setPerformative(ACLMessage.INFORM);
+                        executionReply.setContent("done");
+                        myAgent.send(executionReply);
+                        status = Status.IDLE;
+
+                        System.out.println("Participant - agent " + getAID().getName()
+                                + " execution ENDED.");
+
+                    }
+
+                    break;
             }
         }
 
+    }
+
+    private enum Status {
+        IDLE,
+        PROPOSING,
+        WORKING
     }
 
 }
