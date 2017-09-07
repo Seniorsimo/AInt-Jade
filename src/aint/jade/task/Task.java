@@ -23,4 +23,6 @@ public interface Task extends Serializable{
     
     public String getTaskType();
     
+    public String getName();
+    
 }

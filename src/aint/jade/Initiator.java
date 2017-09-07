@@ -37,6 +37,8 @@ import java.util.stream.Collectors;
  */
 public class Initiator extends Agent {
 
+    static final long SCAN_INTERVAL = 1000L * 10; //10 sec
+
     /**
      * Lista di task pendenti (al momento inizializzata una sola volta nel Setup
      */
@@ -44,23 +46,19 @@ public class Initiator extends Agent {
 
     private AID[] participants;
 
-    /**
-     * Mappa di 'stato' dei task in esecuzione. Più task possono essere
-     * assegnati a participant differenti, quindi per ognuno è necessario
-     * mantenerne un riferimento e tenere traccia del loro stato (running,
-     * completed, error).
-     */
-    private Map<MessageTemplate, TaskBean> pendingTasks;
+    private int pendingTask = 0;
 
     @Override
     protected void setup() {
         this.tasks = new ArrayBlockingQueue<>(100, true);
-        this.tasks.addAll(generateTasks(3));
-        this.pendingTasks = new HashMap<>();
+        this.tasks.addAll(generateTasks(5));
+        this.participants = new AID[0];
         System.out.println("Hello! Initiator " + getAID().getName() + " is ready.");
 
         // Aggiungo il behaviour per avviare un task.
-        addBehaviour(new StartTask());
+        addBehaviour(new DispatchTask());
+        addBehaviour(new DiscoverRunnerBev());
+
     }
 
     @Override
@@ -75,7 +73,7 @@ public class Initiator extends Agent {
     private List<Task> generateTasks(int n) {
         ArrayList<Task> list = new ArrayList<>();
         for (int i = 0; i < n; i++) {
-            list.add(new ImageTask());
+            list.add(new ImageTask("Image_" + i));
         }
         return list;
     }
@@ -90,182 +88,232 @@ public class Initiator extends Agent {
      * libero.
      *
      */
-    private class StartTask extends CyclicBehaviour {
+    private class DispatchTask extends CyclicBehaviour {
 
-        private Status status = Status.IDLE;
+        boolean pendigRequest = false;
+        private Date deadline;
         private MessageTemplate mt;
-        private int replysCount;
         private ACLMessage firstFree;
         private List<ACLMessage> refusingAID;
-        private Date deadline;
+        private int replysCount;
 
         @Override
         public void action() {
-            switch (status) {
 
-                case IDLE:
+            // Se ho finito i task, rimuovo il beahviour
+            if (tasks.isEmpty()) {
+                if (pendingTask <= 0) {
+                    myAgent.removeBehaviour(this);
+                } else {
+                    block();
+                }
 
-                    // Se ho già avviato task, verifico se ho già ottenuto
-                    // risposte, se si controllo lo stato del task e lo rimuovo
-                    // se completo, o lo riaccodo se fallito
-                    if (!pendingTasks.isEmpty()) {
+            } // Se non ho richieste pendenti, faccio richiesta per il successivo task
+            else if (!pendigRequest) {
 
-                        // faccio una copia del set di chiavi, in modo da poter
-                        // rimuovere le chiavi terminate o in errore dalla mappa
-                        // all'interno di questo stesso loop
-                        for (MessageTemplate m : new ArrayList<>(pendingTasks.keySet())) {
+                // Se conosco almeno un partecipant effettuo la richiesta
+                if (participants.length > 0) {
 
-                            ACLMessage reply = myAgent.receive(m);
-                            if (reply != null) {
+                    deadline = sendCFP();
 
-                                if (reply.getPerformative() == ACLMessage.INFORM
-                                        && reply.getContent().equals("done")) {
+                    System.out.println("Initiator - agent " + getAID().getName()
+                            + " looking for participants [" + tasks.peek().getName() + "].");
 
-                                    System.out.println("Initiator - agent " + getAID().getName()
-                                            + " terminated task successfully " + pendingTasks.get(m).getTask().getTaskType() + ".");
+                    replysCount = 0;
+                    firstFree = null;
+                    refusingAID = new ArrayList<>();
+                    pendigRequest = true;
 
-                                    pendingTasks.get(m).setStatus(TaskStatus.COMPLETED);
+                } // In caso contrario attendo
+                else {
 
-                                } else {
+                    block();
 
-                                    System.out.println("Initiator - agent " + getAID().getName()
-                                            + " terminated task with error " + pendingTasks.get(m).getTask().getTaskType() + ".");
+                }
+            } // Se ho richieste pendenti, gestisco le risposte
+            else {
 
-                                    pendingTasks.get(m).setStatus(TaskStatus.ERROR);
+                Date now = new Date();
+                if (deadline.after(now)) {
 
-                                    // Riaccodo il task
-                                    tasks.add(pendingTasks.get(m).getTask());
+                    getCFPResponse();
 
-                                }
-                                pendingTasks.remove(m);
-                            }
+                }
 
-                        }
+                if (replysCount >= participants.length || deadline.before(now)) {
 
+                    if (deadline.before(now)) {
+                        System.out.println("Initiator - agent " + getAID().getName()
+                                + " Request timeout.");
                     }
+                    if (firstFree != null) {
+                        myAgent.addBehaviour(new TaskBehaviour(tasks.poll(), firstFree.getSender()));
+                        pendingTask++;
+                    }
+                    refuse(refusingAID);
+                    pendigRequest = false;
 
-                    // Se ho ancora dei task da smistare, procedo a richiedere
-                    // i participand liberi
-                    if (!tasks.isEmpty()) {
+                }
 
-                        Task task = tasks.peek(); // Guardo il primo task
-                        updateParticipants();
+            }
+        }
 
-                        if (participants.length > 0) {
+        private void getCFPResponse() {
+            ACLMessage reply = myAgent.receive(mt);
+            if (reply != null) {
 
-                            ACLMessage cfp = new ACLMessage(ACLMessage.CFP);
-                            cfp.setConversationId("task-execute");
-                            for (AID participant : participants) {
-                                cfp.addReceiver(participant);
-                            }
-                            cfp.setContent(task.getTaskType());
-                            cfp.setReplyWith("cfp" + System.currentTimeMillis());
+                if (reply.getPerformative() == ACLMessage.PROPOSE) {
+                    if (firstFree == null) {
+                        firstFree = reply;
+                    } else {
+                        refusingAID.add(reply);
+                    }
+                } else {
+                    // do nothing if refused
+                }
 
-                            deadline = new Date(System.currentTimeMillis() + (1000 * 5));
-                            cfp.setReplyByDate(deadline);
-                            myAgent.send(cfp);
+                replysCount++;
 
-                            // Preparo il template per la risposta
-                            mt = MessageTemplate.and(
-                                    MessageTemplate.MatchConversationId(cfp.getConversationId()),
-                                    MessageTemplate.MatchInReplyTo(cfp.getReplyWith())
-                            );
+                System.out.println("Initiator - agent " + getAID().getName()
+                        + " received response: " + replysCount
+                        + "/" + participants.length + ".");
 
-                            System.out.println("Initiator - agent " + getAID().getName()
-                                    + " looking for participants.");
+            } else {
+                block(); // Attendo messaggi
+            }
+        }
 
-                            replysCount = 0;
-                            firstFree = null;
-                            refusingAID = new ArrayList<>();
-                            status = Status.WAITNG_RESPONSE;
+        private Date sendCFP() {
+            ACLMessage cfp = new ACLMessage(ACLMessage.CFP);
+            cfp.setConversationId("task-execute");
+            for (AID participant : participants) {
+                cfp.addReceiver(participant);
+            }
+            cfp.setContent(tasks.peek().getTaskType());
+            cfp.setReplyWith("cfp" + System.currentTimeMillis());
 
-                        } else {
-                            block(3000);
-                        }
+            Date d = new Date(System.currentTimeMillis() + (1000 * 2));
+            cfp.setReplyByDate(d);
+            myAgent.send(cfp);
 
-                        // Se non ho più task da smistare e non ho task appesi
-                        // rimuovo il behaviour, altrimenti attendo messaggi
-                    } else if (pendingTasks.isEmpty()) {
-                        myAgent.removeBehaviour(this);
+            // Preparo il template per la risposta
+            mt = MessageTemplate.and(
+                    MessageTemplate.MatchConversationId(cfp.getConversationId()),
+                    MessageTemplate.MatchInReplyTo(cfp.getReplyWith())
+            );
+            return d;
+        }
+
+        private void refuse(List<ACLMessage> messages) {
+            ACLMessage refusing = new ACLMessage(ACLMessage.REJECT_PROPOSAL);
+            messages.stream()
+                    .filter(x -> x != null)
+                    .forEach((reply) -> {
+                        refusing.addReceiver(reply.getSender());
+                        refusing.setConversationId(reply.getConversationId());
+                    });
+            myAgent.send(refusing);
+        }
+
+    }
+
+    private class TaskBehaviour extends CyclicBehaviour {
+
+        final Task task;
+        final AID partner;
+        boolean sended = false;
+        private MessageTemplate mt;
+
+        public TaskBehaviour(Task task, AID partner) {
+            this.task = task;
+            this.partner = partner;
+        }
+
+        @Override
+        public void action() {
+            if (!sended) {
+
+                sendTask();
+
+            } else {
+
+                ACLMessage reply = myAgent.receive(mt);
+                if (reply != null) {
+
+                    if (reply.getPerformative() == ACLMessage.INFORM
+                            && reply.getContent().equals("done")) {
 
                         System.out.println("Initiator - agent " + getAID().getName()
-                                + " ended.");
+                                + " terminated task successfully [" + task.getName()+ "].");
 
                     } else {
-                        block();
-                    }
-
-                    break;
-
-                case WAITNG_RESPONSE:
-                    Date now = new Date();
-                    if (deadline.after(now)) {
-                        ACLMessage reply = myAgent.receive(mt);
-                        if (reply != null) {
-
-                            if (reply.getPerformative() == ACLMessage.PROPOSE) {
-                                if (firstFree == null) {
-                                    firstFree = reply;
-                                } else {
-                                    refusingAID.add(reply);
-                                }
-                            }
-
-                            replysCount++;
-
-                            System.out.println("Initiator - agent " + getAID().getName()
-                                    + " received response: " + replysCount
-                                    + "/" + participants.length + ".");
-
-                        } else {
-                            block(deadline.getTime() - now.getTime()); // Attendo messaggi
-                        }
-                    }
-
-                    if (replysCount >= participants.length || deadline.before(now)) {
-                        status = firstFree == null ? Status.IDLE : Status.START;
-                    }
-
-                    break;
-
-                case START:
-                    try {
-                        ACLMessage refusing = new ACLMessage(ACLMessage.REJECT_PROPOSAL);
-                        refusingAID.stream().forEach((reply) -> {
-                            refusing.addReceiver(reply.getSender());
-                            refusing.setConversationId(reply.getConversationId());
-                        });
-                        myAgent.send(refusing);
-
-                        Task t = tasks.poll();
-                        ACLMessage sendTask = new ACLMessage(ACLMessage.ACCEPT_PROPOSAL);
-                        sendTask.addReceiver(firstFree.getSender());
-                        sendTask.setConversationId("task-execute");
-                        sendTask.setReplyWith("send" + System.currentTimeMillis());
-                        sendTask.setContentObject(t);
-                        myAgent.send(sendTask);
 
                         System.out.println("Initiator - agent " + getAID().getName()
-                                + " sending task.");
+                                + " terminated task with error [" + task.getName() + "].");
 
-                        // Preparo il template per la risposta
-                        pendingTasks.put(MessageTemplate.and(
-                                MessageTemplate.MatchConversationId(sendTask.getConversationId()),
-                                MessageTemplate.MatchInReplyTo(sendTask.getReplyWith())
-                        ), new TaskBean(t, TaskStatus.RUNNING));
+                        // Riaccodo il task
+                        tasks.add(task);
 
-                        status = Status.IDLE;
-
-                    } catch (IOException ex) {
-                        ex.printStackTrace();
                     }
-                    break;
 
+                    pendingTask--;
+
+                } else {
+
+                    block();
+
+                }
             }
 
         }
 
-        private void updateParticipants() {
+        private void sendTask() {
+            try {
+
+                ACLMessage sendTask = new ACLMessage(ACLMessage.ACCEPT_PROPOSAL);
+                sendTask.addReceiver(partner);
+                sendTask.setConversationId("task-execute");
+                sendTask.setReplyWith("send" + System.currentTimeMillis());
+                sendTask.setContentObject(task);
+                myAgent.send(sendTask);
+
+                System.out.println("Initiator - agent " + getAID().getName()
+                        + " sending task [" + task.getName() + "].");
+
+                // Preparo il template per la risposta
+                mt = MessageTemplate.and(
+                        MessageTemplate.MatchConversationId(sendTask.getConversationId()),
+                        MessageTemplate.MatchInReplyTo(sendTask.getReplyWith())
+                );
+
+                sended = true;
+
+            } catch (IOException ex) {
+                ex.printStackTrace();
+            }
+        }
+
+    }
+
+    private class DiscoverRunnerBev extends CyclicBehaviour {
+
+        private Date lastScan = null;
+
+        @Override
+        public void action() {
+            Date now = new Date();
+            if (lastScan == null || new Date(lastScan.getTime() + SCAN_INTERVAL).before(now)) {
+                updatePartecipants();
+                lastScan = new Date();
+            } else {
+                long missing = (lastScan.getTime() + SCAN_INTERVAL) - now.getTime();
+                block(missing > 0 ? missing : 0);
+            }
+        }
+
+        private void updatePartecipants() {
+
+            System.out.println("Updating runners");
             DFAgentDescription dfd = new DFAgentDescription();
             ServiceDescription sd = new ServiceDescription();
             sd.setType("task-executor");
@@ -277,20 +325,12 @@ public class Initiator extends Agent {
                 for (int i = 0; i < results.length; i++) {
                     participants[i] = results[i].getName();
                 }
+                System.out.println("Found " + participants.length + " runners.");
             } catch (FIPAException e) {
-                e.printStackTrace();
+                System.out.println("Error finding runner: " + e);
             }
-
-            System.out.println("Initiator - agent " + getAID().getName()
-                    + " updated participants, found: " + participants.length + ".");
         }
 
-    }
-
-    private enum Status {
-        IDLE,
-        WAITNG_RESPONSE,
-        START
     }
 
 }

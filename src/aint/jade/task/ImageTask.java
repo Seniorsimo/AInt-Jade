@@ -5,18 +5,25 @@
  */
 package aint.jade.task;
 
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
 /**
  *
  * @author simone
  */
 public class ImageTask implements Task{
 
+    private final String name;
     private int step = 0;
     private static final int STEPS = 10;
 
+    public ImageTask(String name){
+        this.name = name;
+    }
+
+    @Override
+    public String getName() {
+        return name;
+    }
+    
     @Override
     public String getTaskType() {
         return "image";
@@ -25,7 +32,7 @@ public class ImageTask implements Task{
     @Override
     public void executeStep() {
         try {
-            Thread.sleep(1000 * 2);
+            Thread.sleep(100 * 3);
             step++;
         } catch (InterruptedException ex) {
             ex.printStackTrace();
